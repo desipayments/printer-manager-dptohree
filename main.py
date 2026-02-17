@@ -4,6 +4,7 @@ Printer Auto Setup - Complete Solution
 Fixes CUPS issues and restores good UI
 """
 
+import queue
 import pyudev
 import subprocess
 import os
@@ -26,6 +27,7 @@ from gi.repository import Gtk, GLib, Gdk
 PREDEFINED_DRIVERS = {
     "80Series2": "RongtaPos/Printer80.ppd",
     "80Series": "RongtaPos/Printer80.ppd",
+    "L3250": "lsb/usr/epson-inkjet-printer-escpr/Epson/Epson-L3250_Series-epson-inkjet-printer-escpr.ppd.gz"
 }
 
 # Cache configuration
@@ -38,7 +40,7 @@ CUPS_CHECK_TIMEOUT = 3
 CUPS_OPERATION_TIMEOUT = 10
 DRIVER_LOAD_TIMEOUT = 15
 SEARCH_DEBOUNCE_MS = 300
-
+TAGS = ("MODEL:", "MDL:")
 # Thread pool
 executor = ThreadPoolExecutor(max_workers=2)
 
@@ -585,26 +587,57 @@ def extract_model(ieee):
     if not ieee:
         return None
     for part in ieee.split(";"):
-        if part.startswith("MODEL:"):
-            return part.split(":", 1)[1].strip()
+        if part.startswith(TAGS):
+            return part.split(":", 1)[1].strip().split()[0]
     return None
 
-def get_ieee1284_from_lp():
-    """Get printer model info from USB"""
+def get_ieee1284_from_lp(device_name=None):
+    """
+    Get printer IEEE1284 ID string from USB device
+    Args:
+        device_name: Optional device name like 'lp0', 'lp1', etc.
+    Returns:
+        IEEE1284 ID string or None if not found
+    """
+    debug_log(f"get_ieee1284_from_lp called with device_name: {device_name}")
+    
+    # If we have a specific device name, try that path first
+    if device_name:
+        # Standard path: /sys/class/usbmisc/lp0/device/ieee1284_id
+        ieee_path = f"/sys/class/usbmisc/{device_name}/device/ieee1284_id"
+        debug_log(f"Checking: {ieee_path}")
+        
+        if os.path.exists(ieee_path):
+            try:
+                with open(ieee_path, 'r') as f:
+                    data = f.read().strip()
+                    if data:
+                        debug_log(f"Found IEEE data: {data[:50]}...")
+                        return data
+            except Exception as e:
+                debug_log(f"Error reading file: {e}")
+    
+    # If no device name or path doesn't exist, search all devices
+    debug_log("Searching all devices...")
     base = "/sys/class/usbmisc"
+    
     if not os.path.exists(base):
+        debug_log(f"Base path {base} does not exist")
         return None
-
+    
     for lp in os.listdir(base):
         ieee_path = os.path.join(base, lp, "device", "ieee1284_id")
         if os.path.exists(ieee_path):
             try:
-                with open(ieee_path) as f:
+                with open(ieee_path, 'r') as f:
                     data = f.read().strip()
                     if data:
+                        debug_log(f"Found IEEE data from {lp}: {data[:50]}...")
                         return data
             except:
                 continue
+    
+    debug_log("No IEEE1284 data found")
     return None
 
 def change_driver(printer_name, driver_uri):
@@ -627,10 +660,12 @@ def change_driver(printer_name, driver_uri):
         
         if result.returncode != 0:
             # Create new printer
+            usb_uri = get_usb_uri(printer_name)
+            print(f"USB URI: {usb_uri}")
             debug_log(f"Creating new printer: {printer_name}")
             result = subprocess.run([
                 "sudo", "lpadmin", "-p", printer_name,
-                "-v", "usb://", "-E", "-m", driver_uri
+                "-v", usb_uri, "-E", "-m", driver_uri
             ], capture_output=True, text=True, timeout=15)
         else:
             # Update existing printer
@@ -658,6 +693,39 @@ def change_driver(printer_name, driver_uri):
     except Exception as e:
         debug_log(f"Exception changing driver: {e}")
         return False, f"Error: {str(e)}"
+
+
+def get_usb_uri(keyword=None):
+    """
+    Detect USB printer URI using lpinfo -v
+    Optionally filter by keyword (e.g. 'Rongta')
+    """
+    try:
+        result = subprocess.run(
+            ["sudo","lpinfo", "-v"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+    except subprocess.TimeoutExpired:
+        print("Timeout while detecting USB devices.")
+        return None
+
+    if result.returncode != 0:
+        print("Error running lpinfo:")
+        print(result.stderr)
+        return None
+    print(keyword)
+    for line in result.stdout.splitlines():
+        if "usb://" in line:
+            if keyword:
+                if keyword.lower() in line.lower():
+                    return line.split()[-1]
+            else:
+                return line.split()[-1]
+
+    return None
+
 
 # -----------------------------
 # Driver Search Dialog
@@ -924,6 +992,10 @@ class MainWindow(Gtk.ApplicationWindow):
         self.set_default_size(800, 600)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_border_width(10)
+        self.device_queue = queue.Queue()
+        self.processing = False
+        self.processed_devices = set()  # Track processed devices
+        self.processing_timer = None    # For debouncing
         
         # Set icon
         try:
@@ -1689,42 +1761,140 @@ class MainWindow(Gtk.ApplicationWindow):
                 GLib.idle_add(lambda: self.log_message(f"✗ {message}", "red"))
         
         threading.Thread(target=install_in_background, daemon=True).start()
-    
+
+
     def monitor_printers(self):
         """Monitor for USB printers"""
         while self.get_application().monitoring:
             try:
                 monitor = pyudev.Monitor.from_netlink(self.get_application().context)
-                monitor.filter_by(subsystem="usb")
-                debug_log("USB monitor initialized")
+                monitor.filter_by(subsystem="usbmisc")
                 
                 for device in iter(monitor.poll, None):
                     if not self.get_application().monitoring:
                         break
                     
-                    if device.action == "add" and device.get("DEVTYPE") == "usb_device":
-                        debug_log(f"USB device added: {device}")
-                        GLib.idle_add(self.process_usb_device)
-                    
+                    if device.action == "add":
+                        device_name = device.sys_name
+                        device_path = device.sys_path
+                        
+                        # Create a unique identifier for this device
+                        # Use device path or serial number if available
+                        device_id = f"{device_name}_{device_path}"
+                        
+                        # Check if we've already processed this device recently
+                        if device_id in self.processed_devices:
+                            debug_log(f"Ignoring duplicate event for {device_name}")
+                            continue
+                        
+                        debug_log(f"USB device added: {device_name}")
+                        
+                        # Add to processed set
+                        self.processed_devices.add(device_id)
+                        
+                        # Clean up old entries periodically (keep last 10)
+                        if len(self.processed_devices) > 10:
+                            self.processed_devices = set(list(self.processed_devices)[-10:])
+                        
+                        # Add to queue
+                        self.device_queue.put(device_name)
+                        
+                        # Debounce: wait a bit before processing to avoid multiple events
+                        if self.processing_timer:
+                            GLib.source_remove(self.processing_timer)
+                        self.processing_timer = GLib.timeout_add(500, self.start_processing)
+                                
             except Exception as e:
                 debug_log(f"Monitor error: {e}")
                 time.sleep(5)
-    
-    def process_usb_device(self):
+
+    def start_processing(self):
+        """Start processing after debounce delay"""
+        self.processing_timer = None
+        GLib.idle_add(self.process_next_device)
+        return False
+
+    def process_next_device(self):
+        """Process next device from queue"""
+        # Don't process if we're already processing something
+        if self.processing:
+            return False
+        
+        try:
+            device_name = self.device_queue.get_nowait()
+            self.processing = True
+            # Process in a separate thread to avoid blocking the UI
+            threading.Thread(target=self.process_usb_device, args=(device_name,), daemon=True).start()
+        except queue.Empty:
+            self.processing = False
+        
+        return False
+
+    def process_usb_device(self, device_name):
         """Process USB device detection"""
-        time.sleep(1)  # Wait for device initialization
+        try:
+            time.sleep(2)  # Wait longer for device initialization
+            
+            debug_log(f"Processing device: {device_name}")
+            
+            # Check if device still exists
+            device_path = f"/sys/class/usbmisc/{device_name}"
+            if not os.path.exists(device_path):
+                debug_log(f"Device {device_name} no longer exists")
+                self.processing = False
+                GLib.idle_add(self.process_next_device)
+                return
+            
+            ieee = get_ieee1284_from_lp(device_name)
+            if not ieee:
+                debug_log(f"No IEEE data for {device_name}")
+                self.processing = False
+                GLib.idle_add(self.process_next_device)
+                return
+            
+            model = extract_model(ieee)
+            if not model:
+                debug_log(f"No model extracted from {ieee}")
+                self.processing = False
+                GLib.idle_add(self.process_next_device)
+                return
+            
+            # Check if printer is already installed
+            existing_printers = printer_manager.get_available_printers()
+            printer_exists = any(model.lower() in p['name'].lower() or 
+                            model.lower() in p['description'].lower() 
+                            for p in existing_printers)
+            
+            if printer_exists:
+                debug_log(f"Printer {model} already installed, skipping")
+                self.log_message(f"⚠ Printer {model} already installed, skipping auto-setup", "orange")
+                self.processing = False
+                GLib.idle_add(self.process_next_device)
+                return
+            
+            # Show dialog in UI thread
+            GLib.idle_add(self.show_installation_dialog, model, device_name)
+            
+        except Exception as e:
+            debug_log(f"Error processing device {device_name}: {e}")
+            self.processing = False
+            GLib.idle_add(self.process_next_device)
+
+    def show_installation_dialog(self, model, device_name):
+        """Show installation dialog in UI thread"""
         
-        ieee = get_ieee1284_from_lp()
-        if not ieee:
+        # Double-check if printer was installed while we were processing
+        existing_printers = printer_manager.get_available_printers()
+        printer_exists = any(model.lower() in p['name'].lower() or 
+                        model.lower() in p['description'].lower() 
+                        for p in existing_printers)
+        
+        if printer_exists:
+            self.log_message(f"⚠ Printer {model} was already installed", "orange")
+            self.processing = False
+            GLib.idle_add(self.process_next_device)
             return
         
-        model = extract_model(ieee)
-        if not model:
-            return
-        
-        self.log_message(f"🔌 USB printer detected: {model}", "blue")
-        
-        # Ask to install
         dialog = Gtk.MessageDialog(
             parent=self,
             flags=0,
@@ -1732,7 +1902,7 @@ class MainWindow(Gtk.ApplicationWindow):
             buttons=Gtk.ButtonsType.YES_NO,
             text=f"Printer Detected: {model}"
         )
-        dialog.format_secondary_text("Would you like to install this printer?")
+        dialog.format_secondary_text(f"Device: {device_name}\nWould you like to install this printer?")
         
         response = dialog.run()
         dialog.destroy()
@@ -1744,16 +1914,49 @@ class MainWindow(Gtk.ApplicationWindow):
             if model in PREDEFINED_DRIVERS:
                 self.install_driver(printer_name, PREDEFINED_DRIVERS[model])
             else:
-                # Ask for driver selection
-                search_dialog = DriverSearchDialog(self, model=model)
-                selected_driver = search_dialog.show()
-                
-                if selected_driver:
-                    self.install_driver(printer_name, selected_driver)
-                else:
-                    # Use generic driver
-                    self.install_driver(printer_name, "drv:///sample.drv/generic.ppd")
+                # Show driver selection dialog
+                GLib.idle_add(self.show_driver_selection, model, printer_name)
+        else:
+            # Reset processing flag and check for more devices
+            self.processing = False
+            GLib.idle_add(self.process_next_device)
 
+    def show_driver_selection(self, model, printer_name):
+        """Show driver selection dialog"""
+        search_dialog = DriverSearchDialog(self, model=model, printer_name=printer_name)
+        selected_driver = search_dialog.show()
+        
+        if selected_driver:
+            self.install_driver(printer_name, selected_driver)
+        else:
+            # User cancelled, reset processing
+            self.processing = False
+            GLib.idle_add(self.process_next_device)
+
+    def install_driver(self, printer_name, driver_uri, is_existing=False):
+        """Install a printer"""
+        action = "Updating" if is_existing else "Installing"
+        self.log_message(f"{action} driver for '{printer_name}'...", "blue")
+        
+        def install_in_background():
+            try:
+                success, message = change_driver(printer_name, driver_uri)
+                if success:
+                    GLib.idle_add(lambda: self.log_message(f"✓ {message}", "green"))
+                    if not is_existing:
+                        GLib.idle_add(self.load_printers)
+                else:
+                    GLib.idle_add(lambda: self.log_message(f"✗ {message}", "red"))
+            finally:
+                # Always reset processing flag and check for next device
+                GLib.idle_add(self.installation_complete)
+        
+        threading.Thread(target=install_in_background, daemon=True).start()
+
+    def installation_complete(self):
+        """Called when installation is complete"""
+        self.processing = False
+        GLib.idle_add(self.process_next_device)
 # -----------------------------
 # Main
 # -----------------------------

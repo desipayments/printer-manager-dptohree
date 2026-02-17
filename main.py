@@ -27,7 +27,8 @@ from gi.repository import Gtk, GLib, Gdk
 PREDEFINED_DRIVERS = {
     "80Series2": "RongtaPos/Printer80.ppd",
     "80Series": "RongtaPos/Printer80.ppd",
-    "L3250": "lsb/usr/epson-inkjet-printer-escpr/Epson/Epson-L3250_Series-epson-inkjet-printer-escpr.ppd.gz"
+    "L3250": "lsb/usr/epson-inkjet-printer-escpr/Epson/Epson-L3250_Series-epson-inkjet-printer-escpr.ppd.gz",
+    "TM-T20II": "POS-80.ppd",
 }
 
 # Cache configuration
@@ -581,7 +582,7 @@ driver_cache = DriverCache()
 # Helper Functions
 # -----------------------------
 def safe_name(text):
-    return re.sub(r"[^a-zA-Z0-9_]", "_", text)
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", text)
 
 def extract_model(ieee):
     if not ieee:
